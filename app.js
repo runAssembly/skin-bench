@@ -176,8 +176,16 @@ function pickField(d) {                       // strongest-chroma pixel family i
                              if (dd < bd) { bd = dd; bi = k; } });
   return FIELDS[bi];
 }
-const maskAt = (mask, x, y, w, h) =>
-  mask[((y * 320 / h) | 0) * 320 + ((x * 320 / w) | 0)];
+// ⛔ maskAt USED TO ASSUME THE CANVAS SHOWS THE WHOLE PHOTO. As soon as an export size crops the
+//    frame that is false, and the silhouette lands on the wrong pixels. It now maps canvas coords
+//    back through `view` (the region of the source actually on screen) before sampling.
+let view = { sx: 0, sy: 0, sw: 1, sh: 1, iw: 1, ih: 1 };
+const maskAt = (mask, x, y, w, h) => {
+  const sx = view.sx + x * (view.sw / w), sy = view.sy + y * (view.sh / h);
+  const mx = Math.min(319, Math.max(0, (sx / view.iw * 320) | 0));
+  const my = Math.min(319, Math.max(0, (sy / view.ih * 320) | 0));
+  return mask[my * 320 + mx];
+};
 
 const CUTS = [
   ['True Silhouette', (ctx, w, h, mask) => {
@@ -231,31 +239,141 @@ const CUTS = [
   }],
 ];
 
+// --- palette naming ---------------------------------------------------------------------------
+// The reference credits its own palette in the corner ("Turquoise-Cobalt-Sand"). Reading the real
+// colours out of the photo is what makes that line true rather than decorative.
+const NAMED = [
+  ['Black',[18,18,20]], ['Charcoal',[54,54,58]], ['Slate',[96,102,110]], ['Ash',[150,152,150]],
+  ['Bone',[226,222,212]], ['White',[248,248,246]], ['Sand',[214,192,150]], ['Ochre',[188,138,54]],
+  ['Amber',[226,158,38]], ['Saffron',[240,190,44]], ['Rust',[168,74,38]], ['Terracotta',[196,102,72]],
+  ['Crimson',[176,32,44]], ['Madder',[142,38,42]], ['Pink',[226,148,164]], ['Plum',[104,52,96]],
+  ['Violet',[110,74,168]], ['Cobalt',[36,72,168]], ['Azure',[42,128,206]], ['Turquoise',[38,152,166]],
+  ['Teal',[28,104,104]], ['Jade',[46,132,96]], ['Olive',[110,112,54]], ['Moss',[74,96,56]],
+  ['Walnut',[92,62,42]], ['Umber',[68,50,40]], ['Cream',[240,232,208]],
+];
+function palette(d, n = 3) {
+  const bins = new Map();
+  for (let i = 0; i < d.length; i += 4 * 53) {
+    const k = ((d[i] >> 5) << 10) | ((d[i+1] >> 5) << 5) | (d[i+2] >> 5);
+    const e = bins.get(k) || [0, 0, 0, 0];
+    e[0] += d[i]; e[1] += d[i+1]; e[2] += d[i+2]; e[3]++;
+    bins.set(k, e);
+  }
+  const top = [...bins.values()].sort((a, b) => b[3] - a[3]).slice(0, 10)
+    .map(e => [e[0]/e[3], e[1]/e[3], e[2]/e[3]]);
+  const out = [];
+  for (const c of top) {
+    let best = '', bd = 1e9;
+    for (const [nm, v] of NAMED) {
+      const dd = (v[0]-c[0])**2 + (v[1]-c[1])**2 + (v[2]-c[2])**2;
+      if (dd < bd) { bd = dd; best = nm; }
+    }
+    if (!out.includes(best)) out.push(best);
+    if (out.length === n) break;
+  }
+  return out;
+}
+
+// --- text layer -------------------------------------------------------------------------------
+// ⭐ Placement is CHOSEN, not fixed: the type goes wherever the frame is emptiest. When the cutout
+//    mask exists it is authoritative (never cover the subject); without it we fall back to local
+//    luminance variance, which finds flat sky/wall/backdrop well enough.
+function quietCorner(ctx, w, h, mask) {
+  const bw = Math.round(w * 0.42), bh = Math.round(h * 0.20), m = Math.round(Math.min(w, h) * 0.06);
+  const spots = [
+    ['tl', m, m], ['tr', w - bw - m, m],
+    ['bl', m, h - bh - m], ['br', w - bw - m, h - bh - m],
+  ];
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let best = spots[2], bs = Infinity;
+  for (const s of spots) {
+    let subject = 0, n = 0, sum = 0, sum2 = 0;
+    for (let y = s[2]; y < s[2] + bh; y += 3) for (let x = s[1]; x < s[1] + bw; x += 3) {
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      if (mask && maskAt(mask, x, y, w, h) > 0.5) subject++;
+      const v = lum(d[(y*w+x)*4], d[(y*w+x)*4+1], d[(y*w+x)*4+2]);
+      sum += v; sum2 += v * v; n++;
+    }
+    if (!n) continue;
+    const variance = sum2 / n - (sum / n) ** 2;
+    const score = (subject / n) * 4000 + variance;   // subject presence dominates
+    if (score < bs) { bs = score; best = s; }
+  }
+  const d2 = ctx.getImageData(best[1], best[2], Math.min(bw, w - best[1]), Math.min(bh, h - best[2])).data;
+  let s = 0; for (let i = 0; i < d2.length; i += 4) s += lum(d2[i], d2[i+1], d2[i+2]);
+  return { x: best[1], y: best[2], w: bw, h: bh, dark: (s / (d2.length / 4)) < 128, where: best[0] };
+}
+
+function drawText(ctx, w, h, mask) {
+  if (!text.on) return;
+  const title = text.title.trim(), sub = text.sub.trim();
+  const credit = text.credit === 'auto'
+    ? palette(ctx.getImageData(0, 0, w, h).data).join(' · ') : text.credit.trim();
+  if (!title && !sub && !credit) return;
+  const spot = quietCorner(ctx, w, h, mask);
+  const ink = spot.dark ? '#f2f0ea' : '#141416';
+  const unit = Math.max(9, Math.round(Math.min(w, h) / 46));
+  ctx.save();
+  ctx.textBaseline = 'top';
+  let y = spot.y + Math.round(unit * 0.4);
+  // A soft shadow, not a box. The reference sets type on flat fields; a real photo has none, and
+  // a solid scrim would look like a caption bar rather than a print.
+  ctx.shadowColor = spot.dark ? 'rgba(0,0,0,0.55)' : 'rgba(255,255,255,0.55)';
+  ctx.shadowBlur = Math.round(unit * 0.7);
+  const track = (str, size, weight, sp) => {
+    ctx.font = `${weight} ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    ctx.fillStyle = ink;
+    let x = spot.x + Math.round(unit * 0.4);
+    for (const ch of str) { ctx.fillText(ch, x, y); x += ctx.measureText(ch).width + sp; }
+    y += Math.round(size * 1.55);
+  };
+  if (title) track(title.toUpperCase(), unit * 1.15, '600', unit * 0.14);
+  if (sub) track(sub, unit * 0.8, '400', unit * 0.04);
+  if (credit) { y += Math.round(unit * 0.3); track(credit.toUpperCase(), unit * 0.62, '400', unit * 0.16); }
+  ctx.restore();
+}
+
 // --- engine -----------------------------------------------------------------------------------
 const $ = s => document.querySelector(s);
 let sourceImg = null, mask = null, strength = 1, stackWith = null, exportSize = 'native';
+let text = { on: false, title: '', sub: '', credit: 'auto' };
 
 function applyOne(entry, ctx, w, h) {
   if (entry.cut) { if (!mask) return; entry.fn(ctx, w, h, mask); }
   else entry.fn(ctx, w, h);
 }
 
-function draw(entry, cv, img, maxDim) {
-  const sc = Math.min(1, maxDim / Math.max(img.width, img.height));
-  const w = Math.max(1, Math.round(img.width * sc)), h = Math.max(1, Math.round(img.height * sc));
-  cv.width = w; cv.height = h;
+function draw(entry, cv, img, maxDim, target) {
+  // `target` is an export size [w,h]; when set we COVER-CROP THE SOURCE FIRST and then run the
+  // look and the type on the final frame. Doing it the other way round clipped the type and
+  // misaligned the cutout mask.
+  let sx = 0, sy = 0, sw = img.width, sh = img.height, ow, oh;
+  if (target) {
+    const want = target[0] / target[1];
+    if (img.width / img.height > want) { sw = img.height * want; sx = (img.width - sw) / 2; }
+    else { sh = img.width / want; sy = (img.height - sh) / 2; }
+    ow = target[0]; oh = target[1];
+  } else {
+    const sc = Math.min(1, maxDim / Math.max(img.width, img.height));
+    ow = Math.max(1, Math.round(img.width * sc)); oh = Math.max(1, Math.round(img.height * sc));
+  }
+  cv.width = ow; cv.height = oh;
   const ctx = cv.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0, w, h);
-  const before = ctx.getImageData(0, 0, w, h);
-  if (stackWith !== null) applyOne(stackWith, ctx, w, h);
-  applyOne(entry, ctx, w, h);
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, ow, oh);
+  view = { sx, sy, sw, sh, iw: img.width, ih: img.height };
+  const before = ctx.getImageData(0, 0, ow, oh);
+  if (stackWith !== null) applyOne(stackWith, ctx, ow, oh);
+  applyOne(entry, ctx, ow, oh);
   if (strength < 1) {                       // blend back toward the untouched pixels
-    const after = ctx.getImageData(0, 0, w, h), a = after.data, b = before.data;
+    const after = ctx.getImageData(0, 0, ow, oh), a = after.data, b = before.data;
     for (let i = 0; i < a.length; i += 4)
       for (let c = 0; c < 3; c++) a[i+c] = clamp(b[i+c] + (a[i+c] - b[i+c]) * strength);
     ctx.putImageData(after, 0, 0);
   }
-  return { w, h };
+  // Type goes on LAST, on the final frame, and is never blended — half-strength type reads as a
+  // mistake, and type drawn before the crop gets its left edge sliced off.
+  drawText(ctx, ow, oh, mask);
+  return { w: ow, h: oh };
 }
 
 const ALL = () => SKINS.map(s => ({ name: s[0], fn: s[1], cut: false }))
@@ -281,15 +399,8 @@ function render() {
 const SIZES = { native: null, 'post 4:5': [1080,1350], 'story 9:16': [1080,1920], 'square': [1080,1080] };
 function exportCanvas(entry) {
   const cv = document.createElement('canvas');
-  draw(entry, cv, sourceImg, 2400);
-  const t = SIZES[exportSize];
-  if (!t) return cv;
-  const out = document.createElement('canvas'); out.width = t[0]; out.height = t[1];
-  const c = out.getContext('2d');
-  const sc = Math.max(t[0] / cv.width, t[1] / cv.height);
-  const w = cv.width * sc, h = cv.height * sc;
-  c.drawImage(cv, (t[0] - w) / 2, (t[1] - h) / 2, w, h);   // cover-crop, never squash
-  return out;
+  draw(entry, cv, sourceImg, 2400, SIZES[exportSize] || null);
+  return cv;
 }
 function openBig(entry) {
   const cv = exportCanvas(entry);
@@ -303,18 +414,28 @@ function openBig(entry) {
     a.download = entry.name.toLowerCase().replace(/\s+/g, '-') + '.png';
     a.click();
   };
+  $('#link').onclick = async () => {
+    const url = stateToHash(entry);
+    history.replaceState(null, '', url);
+    try { await navigator.clipboard.writeText(url); $('#link').textContent = 'Link copied'; }
+    catch { $('#link').textContent = 'Link is in the address bar'; }
+    setTimeout(() => $('#link').textContent = 'Copy link to this look', 2200);
+  };
+  $('#batchGo').textContent = 'Apply to many photos';
+  $('#batchGo').onclick = () => $('#batchFiles').click();
+  $('#batchFiles').onchange = e => { if (e.target.files.length) runBatch(entry, [...e.target.files]); };
   $('#view').style.display = 'flex';
 }
 
 // --- cutout model -----------------------------------------------------------------------------
-async function computeMask() {
+async function computeMask(quiet) {
   const btn = $('#cut');
-  btn.disabled = true; btn.textContent = 'Loading model…';
+  if (!quiet) { btn.disabled = true; btn.textContent = 'Loading model…'; }
   try {
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
     ort.env.wasm.numThreads = 1;   // GitHub Pages cannot send COOP/COEP, so threads are unavailable
     const sess = await ort.InferenceSession.create('./u2netp.onnx', { executionProviders: ['wasm'] });
-    btn.textContent = 'Finding the subject…';
+    if (!quiet) btn.textContent = 'Finding the subject…';
     await new Promise(r => setTimeout(r, 20));
     const N = 320;
     const c = document.createElement('canvas'); c.width = N; c.height = N;
@@ -333,12 +454,16 @@ async function computeMask() {
     for (let i = 0; i < m.length; i++) mask[i] = (m[i] - lo) / (hi - lo);
     let on = 0; for (const v of mask) if (v > 0.5) on++;
     window.__maskCoverage = 100 * on / mask.length;
-    btn.textContent = 'Cutout on · subject is ' + window.__maskCoverage.toFixed(1) + '% of frame';
-    render();
+    if (!quiet) {
+      btn.textContent = 'Cutout on · subject is ' + window.__maskCoverage.toFixed(1) + '% of frame';
+      render();
+    }
   } catch (e) {
-    btn.disabled = false;
-    btn.textContent = 'Cutout failed — tap to retry';
-    $('#stat').textContent = 'cutout error: ' + e;
+    if (!quiet) {
+      btn.disabled = false;
+      btn.textContent = 'Cutout failed — tap to retry';
+      $('#stat').textContent = 'cutout error: ' + e;
+    }
   }
 }
 
@@ -355,16 +480,130 @@ function boot(img) {
   sourceImg = img; mask = null; stackWith = null;
   $('#drop').style.display = 'none';
   $('#bar').style.display = 'flex';
+  $('#textbar').style.display = 'flex';
   $('#cut').disabled = false;
   $('#cut').textContent = 'Turn on cutout looks (one ~10s pass)';
-  buildStackMenu();
+  buildStackMenu();                    // must exist before applyHash sets its value
+  const wanted = applyHash();          // a shared link restores the treatment, then the grid
+  if (stackWith) $('#stack').value = ALL().findIndex(e => e.name === stackWith.name);
   render();
+  if (wanted) {
+    const e = ALL().find(x => x.name === wanted);
+    if (e) openBig(e);
+  }
 }
 function load(file) {
   if (!file || !file.type.startsWith('image/')) return;
   const img = new Image();
   img.onload = () => boot(img);
   img.src = URL.createObjectURL(file);
+}
+
+// --- shareable link ---------------------------------------------------------------------------
+// The PHOTO cannot go in a URL, and pretending otherwise would be the dishonest version. What the
+// link carries is the TREATMENT — look, strength, stack, export size, and the words.
+function stateToHash(entry) {
+  const p = new URLSearchParams();
+  p.set('look', entry ? entry.name : '');
+  if (strength < 1) p.set('s', Math.round(strength * 100));
+  if (stackWith) p.set('under', stackWith.name);
+  if (exportSize !== 'native') p.set('size', exportSize);
+  if (text.on) {
+    p.set('t', '1');
+    if (text.title) p.set('ti', text.title);
+    if (text.sub) p.set('su', text.sub);
+    if (text.credit !== 'auto') p.set('cr', text.credit);
+  }
+  return location.origin + location.pathname + '#' + p.toString();
+}
+function applyHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (![...p.keys()].length) return null;
+  strength = p.has('s') ? (+p.get('s')) / 100 : 1;
+  $('#strength').value = Math.round(strength * 100);
+  $('#slabel').textContent = Math.round(strength * 100) + '%';
+  exportSize = p.get('size') || 'native';
+  $('#size').value = exportSize;
+  text.on = p.get('t') === '1';
+  text.title = p.get('ti') || ''; text.sub = p.get('su') || '';
+  text.credit = p.get('cr') || 'auto';
+  $('#tOn').checked = text.on; $('#tTitle').value = text.title; $('#tSub').value = text.sub;
+  const names = ALL().map(e => e.name);
+  const ui = names.indexOf(p.get('under'));
+  stackWith = ui >= 0 ? ALL()[ui] : null;
+  $('#stack').value = ui >= 0 ? ui : '';
+  return p.get('look') || null;
+}
+
+// --- batch ------------------------------------------------------------------------------------
+// Store-only ZIP, written by hand. PNGs are already compressed, so there is nothing to gain from
+// deflate and this keeps the app dependency-free and fully offline.
+function crc32(buf) {
+  let c, t = crc32.t;
+  if (!t) {
+    t = crc32.t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+  }
+  c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = t[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function zip(files) {
+  const enc = new TextEncoder(), chunks = [], central = [];
+  let offset = 0;
+  const u16 = v => [v & 255, (v >> 8) & 255];
+  const u32 = v => [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255];
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), n = f.data.length;
+    const local = [...u32(0x04034b50), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
+                   ...u32(crc), ...u32(n), ...u32(n), ...u16(name.length), ...u16(0)];
+    chunks.push(new Uint8Array(local), name, f.data);
+    central.push([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0),
+                  ...u32(crc), ...u32(n), ...u32(n), ...u16(name.length),
+                  ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)]);
+    offset += local.length + name.length + n;
+    central[central.length - 1].push(...name);
+  }
+  const cd = central.flat(), cdStart = offset;
+  chunks.push(new Uint8Array(cd));
+  chunks.push(new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0),
+    ...u16(files.length), ...u16(files.length), ...u32(cd.length), ...u32(cdStart), ...u16(0)]));
+  return new Blob(chunks, { type: 'application/zip' });
+}
+const dataUrlToBytes = u => {
+  const b = atob(u.split(',')[1]), a = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
+  return a;
+};
+async function runBatch(entry, files) {
+  const btn = $('#batchGo');
+  const keep = sourceImg, keepMask = mask;
+  const out = [];
+  for (let i = 0; i < files.length; i++) {
+    btn.textContent = `Processing ${i + 1} of ${files.length}…`;
+    const img = await new Promise(r => { const im = new Image();
+      im.onload = () => r(im); im.src = URL.createObjectURL(files[i]); });
+    sourceImg = img;
+    // ⛔ The mask belongs to the FIRST photo. Reusing it on another would silhouette the wrong
+    //    shape, so cutout looks are computed per photo here and skipped if that is not possible.
+    mask = null;
+    if (entry.cut) { await computeMask(true); }
+    const cv = exportCanvas(entry);
+    out.push({ name: String(i + 1).padStart(2, '0') + '-' +
+                     entry.name.toLowerCase().replace(/\s+/g, '-') + '.png',
+               data: dataUrlToBytes(cv.toDataURL('image/png')) });
+  }
+  sourceImg = keep; mask = keepMask;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zip(out));
+  a.download = 'skin-bench-' + entry.name.toLowerCase().replace(/\s+/g, '-') + '.zip';
+  a.click();
+  btn.textContent = `Apply to many photos (${out.length} done)`;
+  render();
 }
 
 addEventListener('DOMContentLoaded', () => {
@@ -386,10 +625,22 @@ addEventListener('DOMContentLoaded', () => {
   };
   $('#stack').onchange = e => { stackWith = e.target.value === '' ? null : ALL()[+e.target.value]; render(); };
   $('#size').onchange = e => { exportSize = e.target.value; };
-  $('#cut').onclick = computeMask;
+  $('#cut').onclick = () => computeMask(false);
+  const onText = () => {
+    text.on = $('#tOn').checked;
+    text.title = $('#tTitle').value;
+    text.sub = $('#tSub').value;
+    render();
+  };
+  $('#tOn').onchange = onText;
+  let tTimer;
+  const debounced = () => { clearTimeout(tTimer); tTimer = setTimeout(onText, 260); };
+  $('#tTitle').oninput = debounced;
+  $('#tSub').oninput = debounced;
   $('#close').onclick = () => $('#view').style.display = 'none';
   $('#again').onclick = () => {
     $('#drop').style.display = ''; $('#bar').style.display = 'none';
+    $('#textbar').style.display = 'none';
     $('#grid').innerHTML = ''; mask = null;
   };
   Object.keys(SIZES).forEach(k => {
@@ -408,3 +659,14 @@ window.__setSize = s => { exportSize = s; };
 window.__exportCanvas = exportCanvas;
 window.__computeMask = computeMask;
 window.__srcImg = () => sourceImg;
+window.__setText = t => { text = { ...text, ...t }; render(); };
+window.__stateToHash = stateToHash;
+window.__zip = zip;
+window.__runBatch = runBatch;
+window.__quietCorner = quietCorner;
+window.__palette = () => {
+  const cv = document.createElement('canvas');
+  cv.width = sourceImg.width; cv.height = sourceImg.height;
+  cv.getContext('2d', { willReadFrequently: true }).drawImage(sourceImg, 0, 0);
+  return palette(cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data);
+};
